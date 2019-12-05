@@ -93,6 +93,9 @@ class Simulation:
         self.areas_recorded = self.params['recording_dict']['areas_recorded']
         self.T = self.params['t_sim']
 
+        self.time_create = 0
+        self.time_connect = 0
+
     def __eq__(self, other):
         # Two simulations are equal if the simulation parameters and
         # the simulated networks are equal.
@@ -158,6 +161,8 @@ class Simulation:
                               'rng_seeds': list(range(master_seed + 1,
                                                       master_seed + vp + 1))})
 
+        # nest.set_verbosity('M_INFO')
+
         nest.SetDefaults(self.network.params['neuron_params']['neuron_model'],
                          self.network.params['neuron_params']['single_neuron_dict'])
         self.pyrngs = [np.random.RandomState(s) for s in list(range(
@@ -170,12 +175,12 @@ class Simulation:
         - spike detector
         - voltmeter
         """
-        self.spike_detector = nest.Create('spike_detector', 1)
+        self.spike_detector = nest.Create('spike_detector')
         status_dict = deepcopy(self.params['recording_dict']['spike_dict'])
         label = '-'.join((self.label,
                           status_dict['label']))
         status_dict.update({'label': label})
-        nest.SetStatus(self.spike_detector, status_dict)
+        self.spike_detector.set(status_dict)
 
         if self.params['recording_dict']['record_vm']:
             self.voltmeter = nest.Create('voltmeter')
@@ -183,7 +188,7 @@ class Simulation:
             label = '-'.join((self.label,
                               status_dict['label']))
             status_dict.update({'label': label})
-            nest.SetStatus(self.voltmeter, status_dict)
+            self.voltmeter.set(status_dict)
 
     def create_areas(self):
         """
@@ -193,6 +198,8 @@ class Simulation:
         for area_name in self.areas_simulated:
             a = Area(self, self.network, area_name)
             self.areas.append(a)
+            self.time_create += a.time_create
+            self.time_connect += a.time_connect
             print("Memory after {0} : {1:.2f} MB".format(area_name, self.memory() / 1024.))
 
     def cortico_cortical_input(self):
@@ -300,15 +307,21 @@ class Simulation:
 
         self.save_network_gids()
 
-        nest.Simulate(10.0)
-        t4 = time.time()
-        self.time_presimulate = t4 - t3
-        self.total_memory = self.memory()
-        print("Presimulated network in {0:.2f} seconds.".format(self.time_presimulate))
+        print("Network size:", nest.GetKernelStatus('network_size'))
+        print("Saved network in {0:2f} seconds.".format(time.time() - t3))
 
-        nest.Simulate(self.T)
+        t4 = time.time()
+        nest.Prepare()
+        nest.Run(10.)
+        self.time_init = time.time() - t4
+        self.init_memory = self.memory()
+        print("Init time in {0:.2f} seconds.".format(self.time_init))
+
         t5 = time.time()
-        self.time_simulate = t5 - t4
+        nest.Run(self.T)
+        nest.Cleanup()
+        t6 = time.time()
+        self.time_simulate = t6 - t5
         self.total_memory = self.memory()
         print("Simulated network in {0:.2f} seconds.".format(self.time_simulate))
         self.logging()
@@ -328,22 +341,28 @@ class Simulation:
         Write runtime and memory for the first 30 MPI processes
         to file.
         """
-        if nest.Rank() < 30:
-            d = {'time_prepare': self.time_prepare,
-                 'time_network_local': self.time_network_local,
-                 'time_network_global': self.time_network_global,
-                 'time_presimulate': self.time_presimulate,
-                 'time_simulate': self.time_simulate,
-                 'base_memory': self.base_memory,
-                 'network_memory': self.network_memory,
-                 'total_memory': self.total_memory}
-            fn = os.path.join(self.data_dir,
-                              'recordings',
-                              '_'.join((self.label,
-                                        'logfile',
-                                        str(nest.Rank()))))
-            with open(fn, 'w') as f:
-                json.dump(d, f)
+        d = {'time_prepare': self.time_prepare,
+             'time_network_local': self.time_network_local,
+             'time_network_global': self.time_network_global,
+             'time_init': self.time_init,
+             'time_simulate': self.time_simulate,
+             'base_memory': self.base_memory,
+             'network_memory': self.network_memory,
+             'init_memory': self.init_memory,
+             'total_memory': self.total_memory,
+             'time_create': self.time_create,
+             'time_connect':self.time_connect,
+             'num_connections': nest.GetKernelStatus('num_connections'),
+             'local_spike_counter': nest.GetKernelStatus('local_spike_counter')}
+        print(d)
+        
+        fn = os.path.join(self.data_dir,
+                          'recordings',
+                          '_'.join((self.label,
+                                    'logfile',
+                                    str(nest.Rank()))))
+        with open(fn, 'w') as f:
+            json.dump(d, f)
 
     def save_network_gids(self):
         with open(os.path.join(self.data_dir,
@@ -406,9 +425,13 @@ class Area:
         for pop in self.populations:
             self.external_synapses[pop] = self.network.K[self.name][pop]['external']['external']
 
+        t0 = time.time()
         self.create_populations()
+        t1 = time.time()
+        self.time_create = t1 - t0
         self.connect_devices()
         self.connect_populations()
+        self.time_connect = time.time() - t1
         print("Rank {}: created area {} with {} local nodes".format(nest.Rank(),
                                                                     self.name,
                                                                     self.num_local_nodes))
@@ -445,33 +468,17 @@ class Area:
                 DC = K_ext * W_ext * tau_syn * 1.e-3 * \
                     self.network.params['rate_ext']
                 I_e += DC
-            nest.SetStatus(gid, {'I_e': I_e})
+            gid.set({'I_e': I_e})
 
-            # Store first and last GID of each population
-            self.gids[pop] = (gid[0], gid[-1])
+            # Store GIDCollection of each population
+            self.gids[pop] = gid
 
             # Initialize membrane potentials
             # This could also be done after creating all areas, which
             # might yield better performance. Has to be tested.
-            for t in np.arange(nest.GetKernelStatus('local_num_threads')):
-                local_nodes = np.array(nest.GetNodes(
-                    [0], {
-                        'model': self.network.params['neuron_params']['neuron_model'],
-                        'thread': t
-                    }, local_only=True
-                )[0])
-                local_nodes_pop = local_nodes[(np.logical_and(local_nodes >= gid[0],
-                                                              local_nodes <= gid[-1]))]
-                if len(local_nodes_pop) > 0:
-                    vp = nest.GetStatus([local_nodes_pop[0]], 'vp')[0]
-                    # vp is the same for all local nodes on the same thread
-                    nest.SetStatus(
-                        list(local_nodes_pop), 'V_m', self.simulation.pyrngs[vp].normal(
-                            self.network.params['neuron_params']['V0_mean'],
-                            self.network.params['neuron_params']['V0_sd'],
-                            len(local_nodes_pop))
-                            )
-                    self.num_local_nodes += len(local_nodes_pop)
+            gid.set({'V_m':
+                     nest.random.normal(self.network.params['neuron_params']['V0_mean'],
+                                       self.network.params['neuron_params']['V0_sd'])})
 
     def connect_populations(self):
         """
@@ -486,7 +493,7 @@ class Area:
             for pop in self.populations:
                 # Always record spikes from all neurons to get correct
                 # statistics
-                nest.Connect(tuple(range(self.gids[pop][0], self.gids[pop][1] + 1)),
+                nest.Connect(self.gids[pop],
                              self.simulation.spike_detector)
 
         if self.simulation.params['recording_dict']['record_vm']:
@@ -494,19 +501,17 @@ class Area:
                 nrec = int(self.simulation.params['recording_dict']['Nrec_vm_fraction'] *
                            self.neuron_numbers[pop])
                 nest.Connect(self.simulation.voltmeter,
-                             tuple(range(self.gids[pop][0], self.gids[pop][0] + nrec + 1)))
+                             self.gids[pop][:nrec])
         if self.network.params['input_params']['poisson_input']:
             self.poisson_generators = []
             for pop in self.populations:
                 K_ext = self.external_synapses[pop]
                 W_ext = self.network.W[self.name][pop]['external']['external']
-                pg = nest.Create('poisson_generator', 1)
-                nest.SetStatus(
-                    pg, {'rate': self.network.params['input_params']['rate_ext'] * K_ext})
+                pg = nest.Create('poisson_generator')
+                pg.set({'rate': self.network.params['input_params']['rate_ext'] * K_ext})
                 syn_spec = {'weight': W_ext}
                 nest.Connect(pg,
-                             tuple(
-                                 range(self.gids[pop][0], self.gids[pop][1] + 1)),
+                             self.gids[pop],
                              syn_spec=syn_spec)
                 self.poisson_generators.append(pg[0])
 
@@ -547,24 +552,20 @@ class Area:
                 K = synapses[pop][source_pop] / self.neuron_numbers[pop]
 
                 if input_type == 'het_current_nonstat':
-                    curr_gen = nest.Create('step_current_generator', 1)
+                    curr_gen = nest.Create('step_current_generator')
                     dt = self.simulation.params['dt']
                     T = self.simulation.params['t_sim']
                     assert(len(cc_input[source_pop]) == int(T))
-                    nest.SetStatus(curr_gen, {'amplitude_values': K * cc_input[source_pop] * 1e-3,
-                                              'amplitude_times': np.arange(dt,
-                                                                           T + dt,
-                                                                           1.)})
+                    curr_gen.set({'amplitude_values': K * cc_input[source_pop] * 1e-3,
+                                  'amplitude_times': np.arange(dt, T + dt, 1.)})
                     nest.Connect(curr_gen,
-                                 tuple(
-                                     range(self.gids[pop][0], self.gids[pop][1] + 1)),
+                                 self.gids[pop],
                                  syn_spec=syn_spec)
                 elif 'poisson_stat' in input_type:  # hom. and het. poisson lead here
-                    pg = nest.Create('poisson_generator', 1)
-                    nest.SetStatus(pg, {'rate': K * cc_input[source_pop]})
+                    pg = nest.Create('poisson_generator')
+                    pg.set({'rate': K * cc_input[source_pop]})
                     nest.Connect(pg,
-                                 tuple(
-                                     range(self.gids[pop][0], self.gids[pop][1] + 1)),
+                                 self.gids,
                                  syn_spec=syn_spec)
 
 
@@ -624,9 +625,7 @@ def connect(simulation,
                         'delay': syn_delay,
                         'model': 'static_synapse'}
 
-            nest.Connect(tuple(range(source_area.gids[source][0],
-                                     source_area.gids[source][1] + 1)),
-                         tuple(range(target_area.gids[target][0],
-                                     target_area.gids[target][1] + 1)),
+            nest.Connect(source_area.gids[source],
+                         target_area.gids[target],
                          conn_spec,
                          syn_spec)
